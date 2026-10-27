@@ -1,19 +1,20 @@
 import os
+import re
 import html
+import hmac
 import time
+import random
 import threading
-import base64
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from telebot import types
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-import requests
 import telebot
+from flask import Flask, request, jsonify
 
 # ============================================================
 # KONFIGURASI
@@ -34,9 +35,20 @@ def parse_ids(raw):
 # Boleh banyak admin: ADMIN_IDS=111,222  (ADMIN_ID lama tetap didukung)
 ADMIN_IDS = parse_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", "8953615855"))
 
-KLIKQRIS_API_KEY = os.getenv("KLIKQRIS_API_KEY")
-KLIKQRIS_MERCHANT_ID = os.getenv("KLIKQRIS_MERCHANT_ID", "179009297448")
-KLIKQRIS_BASE_URL = os.getenv("KLIKQRIS_BASE_URL", "https://klikqris.com/api").rstrip("/")
+# --- QRIS statis DANA Bisnis + pembacaan notifikasi lewat webhook ---
+# Foto QRIS statis Anda (taruh di repo, atau arahkan lewat env QRIS_IMAGE_PATH).
+QRIS_IMAGE_PATH = os.getenv("QRIS_IMAGE_PATH", "qris.png")
+
+# Kata rahasia. HP pengirim notifikasi wajib mengirimnya lewat header "X-Secret"
+# (atau query ?secret=...). Tanpa ini, orang lain bisa memalsukan pembayaran.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# Notifikasi dianggap pembayaran jika mengandung kata ini (huruf kecil).
+# Contoh notifikasi: "Pembayaran masuk, Rp85.137 diterima DANA Bisnis."
+NOTIF_KEYWORD = os.getenv("NOTIF_KEYWORD", "pembayaran masuk").strip().lower()
+
+# Kode unik 1..UNIQUE_CODE_MAX ditambahkan ke harga agar tiap order punya nominal berbeda.
+UNIQUE_CODE_MAX = int(os.getenv("UNIQUE_CODE_MAX", "499"))
 
 # Lokasi database. Di Railway arahkan ke Volume, mis. DB_PATH=/data/bot.db
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
@@ -71,8 +83,11 @@ WIB = timezone(timedelta(hours=7))
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN belum diset.")
 
-if not KLIKQRIS_API_KEY:
-    raise RuntimeError("KLIKQRIS_API_KEY belum diset.")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET belum diset.")
+
+if not os.path.exists(QRIS_IMAGE_PATH):
+    raise RuntimeError(f"File QRIS tidak ditemukan: {QRIS_IMAGE_PATH}")
 
 
 bot = telebot.TeleBot(TOKEN)
@@ -290,104 +305,67 @@ def is_private(message):
 
 
 # ============================================================
-# KLIKQRIS API
+# QRIS STATIS DANA BISNIS + NOMINAL UNIK
 # ============================================================
 
-def klikqris_headers():
-    return {
-        "Content-Type": "application/json",
-        "x-api-key": KLIKQRIS_API_KEY,
-        "id_merchant": KLIKQRIS_MERCHANT_ID,
+_qris_file_id = None  # cache file_id Telegram agar foto QRIS tidak di-upload ulang tiap order
+
+
+def alokasi_nominal_unik():
+    """
+    Nominal unik = harga + kode 1..UNIQUE_CODE_MAX.
+    QRIS statis tidak membawa order_id, jadi pembeli dikenali dari nominalnya.
+    Nominal milik order PENDING dan order 1 jam terakhir dihindari supaya
+    pembayaran yang telat tidak salah cocok ke pembeli lain.
+    Panggil di dalam db_lock bersama INSERT order.
+    """
+    dipakai = {
+        r["amount"]
+        for r in rows(
+            "SELECT amount FROM orders WHERE payment_method='DANA_STATIC' "
+            "AND (status='PENDING' OR created_at>=?)",
+            (now_ts() - 3600,),
+        )
     }
+    kandidat = [PRICE + k for k in range(1, UNIQUE_CODE_MAX + 1) if PRICE + k not in dipakai]
+    if not kandidat:
+        raise RuntimeError("Semua kode unik sedang terpakai, coba lagi nanti.")
+    return random.choice(kandidat)
 
 
-def pilih_metode_pembayaran():
-    """MY PG sebelum pukul 06.00 WIB; PG KlikQRIS mulai pukul 06.00 WIB."""
-    sekarang = datetime.now(WIB)
-    return "MY_PG" if sekarang.hour < 6 else "PG_KLIQRIS"
-
-
-def create_qris(order_id, metode=None):
-    """Membuat QRIS menggunakan endpoint sesuai metode yang sudah dipilih."""
-    metode = metode or pilih_metode_pembayaran()
-    if metode == "MY_PG":
-        url = f"{KLIKQRIS_BASE_URL}/qrisv2/create"
-    elif metode == "PG_KLIQRIS":
-        url = f"{KLIKQRIS_BASE_URL}/qris/create"
-    else:
-        raise RuntimeError(f"Metode pembayaran tidak dikenal: {metode}")
-
-    payload = {
-        "order_id": order_id,
-        "id_merchant": KLIKQRIS_MERCHANT_ID,
-        "amount": PRICE,
-        "keterangan": f"Paket VIP 11 Grup - Telegram {order_id}",
-    }
-
-    print(
-        f"[PAYMENT ROUTER] Waktu WIB: {datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')}; "
-        f"metode={metode}; endpoint={url}"
-    )
-    response = requests.post(url, json=payload, headers=klikqris_headers(), timeout=20)
-    try:
-        result = response.json()
-    except ValueError:
-        result = {}
-
-    if response.status_code >= 400:
-        print(f"[KLIKQRIS] HTTP {response.status_code}; metode={metode}")
-        print(f"[KLIKQRIS] Response: {response.text[:1000]}")
-        message = result.get("message") or result.get("error") or result.get("errors") or response.text or f"HTTP {response.status_code}"
-        raise RuntimeError(f"KlikQRIS ({metode}) menolak request ({response.status_code}): {message}")
-
-    if not result.get("status"):
-        raise RuntimeError(result.get("message", "KlikQRIS menolak transaksi."))
-
-    data = result.get("data") or {}
-    if not data.get("order_id"):
-        raise RuntimeError("Response KlikQRIS tidak berisi order_id.")
-    return data
-
-
-def get_qris_status(order_id, metode=None):
-    """Ambil status dari endpoint provider yang membuat invoice."""
-    metode = metode or "MY_PG"
-    if metode == "MY_PG":
-        url = f"{KLIKQRIS_BASE_URL}/qrisv2/status/{KLIKQRIS_MERCHANT_ID}/{order_id}"
-    elif metode == "PG_KLIQRIS":
-        url = f"{KLIKQRIS_BASE_URL}/qris/status/{order_id}"
-    else:
-        raise RuntimeError(f"Metode pembayaran tidak dikenal untuk status: {metode}")
-
-    response = requests.get(url, headers=klikqris_headers(), timeout=20)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("status"):
-        raise RuntimeError(result.get("message", "Gagal mengambil status transaksi."))
-    return result.get("data") or {}
-
-
-def qris_photo_from_data(data):
-    qris_image = data.get("qris_image")
-
-    if isinstance(qris_image, str) and qris_image.startswith("data:image"):
+def kirim_qris(chat_id, caption):
+    """Kirim foto QRIS statis (memakai file_id hasil cache bila ada)."""
+    global _qris_file_id
+    if _qris_file_id:
         try:
-            encoded = qris_image.split(",", 1)[1]
-            return BytesIO(base64.b64decode(encoded))
-        except Exception:
-            pass
+            return bot.send_photo(chat_id, _qris_file_id, caption=caption, parse_mode="HTML")
+        except Exception as e:
+            print(f"[WARN] file_id QRIS gagal dipakai, upload ulang: {e}")
+            _qris_file_id = None
+    with open(QRIS_IMAGE_PATH, "rb") as f:
+        sent = bot.send_photo(chat_id, f, caption=caption, parse_mode="HTML")
+    try:
+        _qris_file_id = sent.photo[-1].file_id
+    except Exception:
+        pass
+    return sent
 
-    qris_url = data.get("qris_url")
 
-    if qris_url:
-        response = requests.get(qris_url, timeout=20)
-        response.raise_for_status()
-
-        photo = BytesIO(response.content)
-        photo.name = "qris.png"
-        return photo
-
-    return None
+def parse_nominal_notif(teks):
+    """
+    'Pembayaran masuk, Rp85.137 diterima DANA Bisnis.' -> 85137
+    Return None jika teks bukan notifikasi pembayaran masuk.
+    """
+    t = " ".join(str(teks or "").split()).lower()
+    if NOTIF_KEYWORD not in t:
+        return None
+    m = re.search(r"rp\.?\s*([\d.,]+)", t)
+    if not m:
+        return None
+    raw = m.group(1).rstrip(".,")
+    raw = re.sub(r",\d{1,2}$", "", raw)  # buang desimal seperti ",00"
+    digits = re.sub(r"\D", "", raw)
+    return int(digits) if digits else None
 
 
 # ============================================================
@@ -587,6 +565,10 @@ def fulfill_order(chat_id, order_id, qr_message_id):
 
 
 def _monitor(chat_id, order_id, qr_message_id):
+    """
+    Pembayaran dideteksi oleh webhook (/notif) yang memanggil fulfill_order.
+    Fungsi ini hanya menutup order yang tidak dibayar dalam batas waktu.
+    """
     order = get_order(order_id)
     if not order:
         return
@@ -597,28 +579,6 @@ def _monitor(chat_id, order_id, qr_message_id):
         if not current or current["status"] != "PENDING":
             finish_transaction(chat_id, order_id)
             return
-
-        try:
-            data = get_qris_status(order_id, current["payment_method"])
-            status = str(data.get("status", "")).upper()
-
-            if status in ("SUCCESS", "PAID"):
-                fulfill_order(chat_id, order_id, qr_message_id)
-                return
-
-            if status == "EXPIRED":
-                run("UPDATE orders SET status='EXPIRED' WHERE order_id=? AND status='PENDING'", (order_id,))
-                edit_qr_caption(
-                    chat_id, qr_message_id,
-                    "⏰ <b>QRIS Kedaluwarsa</b>\n\n"
-                    f"Order ID: <code>{html.escape(order_id)}</code>\n"
-                    "Silakan tekan tombol pembelian kembali jika ingin membuat transaksi baru."
-                )
-                finish_transaction(chat_id, order_id)
-                return
-
-        except Exception as e:
-            print(f"[WARN] Cek status {order_id}: {e}")
 
         if time.time() >= deadline:
             break
@@ -728,7 +688,7 @@ def handle_buy_menu(message):
     bot.send_message(
         chat_id,
         "Anda memilih <b>Paket VIP 11 Grup Sekaligus (Rp 85.000)</b>.\n\n"
-        "Klik tombol di bawah untuk membuat QRIS dinamis:",
+        "Klik tombol di bawah untuk menampilkan QRIS pembayaran:",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -762,7 +722,7 @@ def handle_faq(message):
         "💡 <b>Panduan:</b>\n\n"
         "1. Klik <b>🛒 Beli Paket VIP 11 Grup</b>.\n"
         "2. Klik <b>💳 Tampilkan QRIS Pembayaran</b>.\n"
-        "3. Scan QRIS dan bayar sesuai nominal yang tampil.\n"
+        "3. Scan QRIS, lalu bayar <b>persis</b> sesuai total yang tampil (termasuk kode unik).\n"
         "4. Bot akan mengecek pembayaran otomatis.\n"
         "5. Setelah pembayaran berhasil, 11 link sekali pakai dikirim otomatis.\n\n"
         "Tidak perlu kirim screenshot pembayaran.",
@@ -801,7 +761,7 @@ def process_show_qris(call):
         bot.answer_callback_query(call.id, "Akun tidak dapat melakukan pembelian.", show_alert=True)
         return
 
-    bot.answer_callback_query(call.id, "Membuat QRIS dinamis...")
+    bot.answer_callback_query(call.id, "Menyiapkan QRIS...")
     bot.send_chat_action(chat_id, "upload_photo")
 
     order_id = f"VIP11-{chat_id}-{int(time.time())}"
@@ -823,113 +783,65 @@ def process_show_qris(call):
         )
         return
 
-    metode = pilih_metode_pembayaran()
-    print(f"[PAYMENT ROUTER] Invoice baru {order_id}; metode terpilih={metode}")
-    run(
-        "INSERT INTO orders(order_id, user_id, amount, payment_method, status, created_at) VALUES(?,?,?,?,?,?)",
-        (order_id, chat_id, PRICE, metode, "PENDING", now_ts()),
-    )
-
     def fail_order():
         run("UPDATE orders SET status='FAILED' WHERE order_id=? AND status='PENDING'", (order_id,))
         finish_transaction(chat_id)
 
+    progress_message = None
     try:
         progress_message = bot.send_message(
             chat_id,
-            "⏳ <b>Sedang menyiapkan dan mengirimkan gambar QRIS...</b>",
+            "⏳ <b>Sedang menyiapkan QRIS...</b>",
             parse_mode="HTML",
         )
-        data = create_qris(order_id, metode)
 
-        returned_order_id = str(data.get("order_id", order_id))
-        if returned_order_id != order_id:
-            run("UPDATE orders SET order_id=? WHERE order_id=?", (returned_order_id, order_id))
-            with transaction_lock:
-                active_transactions[chat_id] = {
-                    "order_id": returned_order_id,
-                    "created_at": time.time(),
-                }
+        # Pilih nominal unik dan simpan order dalam satu kunci agar tidak ada nominal kembar.
+        with db_lock:
+            pay_amount = alokasi_nominal_unik()
+            run(
+                "INSERT INTO orders(order_id, user_id, amount, payment_method, status, created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (order_id, chat_id, pay_amount, "DANA_STATIC", "PENDING", now_ts()),
+            )
 
-        total_amount = data.get("total_amount", PRICE)
-        expired_at = data.get("expired_at", "-")
-
-        photo = qris_photo_from_data(data)
-
+        kode_unik = pay_amount - PRICE
         caption = (
-            "💳 <b>QRIS PEMBAYARAN DINAMIS</b>\n\n"
+            "💳 <b>PEMBAYARAN QRIS</b>\n\n"
             "Paket: <b>VIP 11 Grup</b>\n"
-            f"Nominal: <b>{rupiah(int(float(total_amount)))}</b>\n"
-            f"Order ID: <code>{html.escape(returned_order_id)}</code>\n"
-            f"Batas pemantauan bot: <b>15 menit</b>\n"
-            f"Expired dari KlikQRIS: <b>{html.escape(str(expired_at))}</b>\n\n"
-            "Silakan scan QR di atas dan lakukan pembayaran.\n\n"
-            "✅ Setelah pembayaran berhasil, bot akan mendeteksi otomatis "
+            f"Harga: {rupiah(PRICE)}\n"
+            f"Kode unik: {rupiah(kode_unik)}\n"
+            f"Total bayar: <b>{rupiah(pay_amount)}</b>\n"
+            f"Order ID: <code>{html.escape(order_id)}</code>\n"
+            "Batas pembayaran: <b>15 menit</b>\n\n"
+            "⚠️ <b>Bayar PERSIS sesuai total di atas</b> (termasuk kode unik). "
+            "Jika nominal berbeda, pembayaran tidak dapat dideteksi otomatis.\n\n"
+            "Scan QR di atas, masukkan nominal, lalu bayar.\n\n"
+            "✅ Setelah pembayaran masuk, bot mendeteksi otomatis "
             "dan mengirim 11 link VIP sekali pakai.\n"
             "❌ Tidak perlu mengirim screenshot bukti pembayaran."
         )
 
-        if photo:
-            sent = bot.send_photo(
-                chat_id,
-                photo,
-                caption=caption,
-                parse_mode="HTML"
-            )
-            try:
-                bot.delete_message(chat_id, progress_message.message_id)
-            except Exception:
-                pass
-        else:
-            direct_url = data.get("direct_url")
-            qris_url = data.get("qris_url")
+        sent = kirim_qris(chat_id, caption)
 
-            markup = types.InlineKeyboardMarkup()
-            if direct_url:
-                markup.add(
-                    types.InlineKeyboardButton(
-                        "💳 Buka Halaman Pembayaran",
-                        url=direct_url
-                    )
-                )
+        try:
+            bot.delete_message(chat_id, progress_message.message_id)
+        except Exception:
+            pass
 
-            bot.send_message(
-                chat_id,
-                caption + (
-                    f"\n\nQRIS URL: {html.escape(str(qris_url))}"
-                    if qris_url else ""
-                ),
-                parse_mode="HTML",
-                reply_markup=markup if direct_url else None
-            )
-
-            sent = bot.send_message(
-                chat_id,
-                "⏳ <b>Menunggu pembayaran...</b>",
-                parse_mode="HTML"
-            )
-            try:
-                bot.delete_message(chat_id, progress_message.message_id)
-            except Exception:
-                pass
-
-        run("UPDATE orders SET qr_message_id=? WHERE order_id=?", (sent.message_id, returned_order_id))
-        start_monitor(chat_id, returned_order_id, sent.message_id)
-
-    except requests.RequestException as e:
-        print(f"[ERROR] KlikQRIS HTTP error: {e}")
-        fail_order()
-        bot.send_message(
-            chat_id,
-            "❌ Gagal menghubungi server pembayaran. Silakan coba lagi beberapa saat."
-        )
+        run("UPDATE orders SET qr_message_id=? WHERE order_id=?", (sent.message_id, order_id))
+        start_monitor(chat_id, order_id, sent.message_id)
 
     except Exception as e:
-        print(f"[ERROR] Gagal membuat QRIS: {e}")
+        print(f"[ERROR] Gagal menampilkan QRIS: {e}")
         fail_order()
+        if progress_message:
+            try:
+                bot.delete_message(chat_id, progress_message.message_id)
+            except Exception:
+                pass
         bot.send_message(
             chat_id,
-            "❌ Gagal membuat QRIS dinamis. Silakan coba lagi atau hubungi admin."
+            "❌ Gagal menampilkan QRIS. Silakan coba lagi atau hubungi admin."
         )
 
 
@@ -1392,10 +1304,110 @@ def cb_broadcast(call):
 
 
 # ============================================================
+# WEBHOOK NOTIFIKASI DANA BISNIS
+# ============================================================
+# HP Android (MacroDroid / Tasker) meneruskan notifikasi DANA Bisnis ke:
+#   POST https://<domain-railway>/notif      header: X-Secret: <WEBHOOK_SECRET>
+# Body boleh JSON ({"title": "...", "text": "..."}), form, atau teks biasa.
+
+web = Flask(__name__)
+
+
+def secret_valid():
+    supplied = request.headers.get("X-Secret") or request.args.get("secret") or ""
+    return hmac.compare_digest(supplied.encode("utf-8"), WEBHOOK_SECRET.encode("utf-8"))
+
+
+def extract_notif_text():
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return " ".join(
+            str(v) for k, v in data.items()
+            if k != "secret" and isinstance(v, (str, int, float))
+        )
+    if request.form:
+        return " ".join(v for k, v in request.form.items() if k != "secret")
+    args = {k: v for k, v in request.args.items() if k != "secret"}
+    if args:
+        return " ".join(args.values())
+    return request.get_data(as_text=True) or ""
+
+
+@web.get("/")
+def web_health():
+    return "ok"
+
+
+@web.route("/notif", methods=["POST", "GET"])
+def webhook_notif():
+    if not secret_valid():
+        return jsonify(ok=False, error="forbidden"), 403
+
+    teks = extract_notif_text()
+    nominal = parse_nominal_notif(teks)
+    print(f"[NOTIF] teks={teks[:200]!r}; nominal={nominal}")
+
+    if nominal is None:
+        return jsonify(ok=True, matched=False, reason="bukan notifikasi pembayaran")
+
+    order = row(
+        "SELECT * FROM orders WHERE status='PENDING' AND payment_method='DANA_STATIC' AND amount=?",
+        (nominal,),
+    )
+    if order:
+        threading.Thread(
+            target=fulfill_order,
+            args=(order["user_id"], order["order_id"], order["qr_message_id"]),
+            daemon=True,
+        ).start()
+        return jsonify(ok=True, matched=True, order_id=order["order_id"])
+
+    # Notifikasi yang sama terkirim dua kali: abaikan diam-diam.
+    duplikat = row(
+        "SELECT 1 FROM orders WHERE status='SUCCESS' AND payment_method='DANA_STATIC' "
+        "AND amount=? AND paid_at>=?",
+        (nominal, now_ts() - 120),
+    )
+    if duplikat:
+        return jsonify(ok=True, matched=False, reason="duplikat")
+
+    # Tidak ada order PENDING yang cocok: beri tahu admin untuk dicek manual.
+    telat = row(
+        "SELECT * FROM orders WHERE status='EXPIRED' AND payment_method='DANA_STATIC' "
+        "AND amount=? AND created_at>=? ORDER BY created_at DESC",
+        (nominal, now_ts() - 7200),
+    )
+    if telat:
+        info = (
+            "Cocok dengan order yang sudah kedaluwarsa:\n"
+            f"Order: <code>{esc(telat['order_id'])}</code>\n"
+            f"Pembeli: {user_label(telat['user_id'])}\n\n"
+            f"Kirim manual: <code>/kirimlink {telat['user_id']} &lt;1-11&gt;</code>"
+        )
+    else:
+        info = (
+            "Tidak cocok dengan order mana pun. Kemungkinan pembeli membayar tidak persis "
+            "sesuai nominal unik, atau pembayaran tidak berasal dari bot."
+        )
+    notify_admins(
+        "⚠️ <b>Pembayaran masuk tanpa order cocok</b>\n\n"
+        f"Nominal: <b>{rupiah(nominal)}</b>\n"
+        f"Waktu: {fmt_time(now_ts())}\n\n{info}"
+    )
+    return jsonify(ok=True, matched=False, reason="tidak ada order cocok")
+
+
+def run_webhook():
+    port = int(os.getenv("PORT", "8080"))
+    web.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+
+
+# ============================================================
 # JALANKAN BOT
 # ============================================================
 
 if __name__ == "__main__":
     print(f"Bot berjalan... ADMIN_IDS={ADMIN_IDS}")
     resume_pending_orders()
+    threading.Thread(target=run_webhook, daemon=True).start()
     bot.infinity_polling(skip_pending=True)
